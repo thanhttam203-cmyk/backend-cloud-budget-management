@@ -1,0 +1,1 @@
+Run: npm ci; copy .env.example to .env and set correct values; configure gcloud auth application-default login; $env:PORT="8082"; node server.js. API: http://localhost:8082. Do not commit .env or credentials. Frontend calls local API only on the Backend host.

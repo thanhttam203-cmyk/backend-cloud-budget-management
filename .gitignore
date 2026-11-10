@@ -1,0 +1,12 @@
+node_modules/
+.env
+.DS_Store
+# Local test images
+hoa-don-test.png
+test-receipt.png
+
+# Local backups
+server.js.before-budget.bak
+
+# Temporary Windows files
+New Text Document.txt
