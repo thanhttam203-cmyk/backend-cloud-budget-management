@@ -423,6 +423,61 @@ app.post("/categories", async (req, res, next) => {
 ===================================================== */
 
 // GET /budgets - Lấy danh sách ngân sách
+
+// ===== Chức năng 2: Sửa và xóa danh mục tùy chỉnh =====
+app.put("/categories/:id", async (req, res, next) => {
+  try {
+    const id = req.params.id;
+    if (!/^[a-zA-Z0-9_-]+$/.test(id)) return res.status(400).json({ error: "ID danh mục không hợp lệ" });
+    if (DEFAULT_CATEGORIES.some(c => c.id === id)) return res.status(403).json({ error: "Không thể sửa danh mục mặc định" });
+    const ref = userCollection(req.uid, "categories").doc(id);
+    const doc = await ref.get();
+    if (!doc.exists) return res.status(404).json({ error: "Danh mục không tồn tại" });
+    const { name, type, icon } = req.body || {};
+    if (name !== undefined && (typeof name !== "string" || !name.trim())) return res.status(400).json({ error: "name không hợp lệ" });
+    if (icon !== undefined && typeof icon !== "string") return res.status(400).json({ error: "icon phải là chuỗi" });
+    if (type !== undefined && !["income", "expense"].includes(type)) return res.status(400).json({ error: "type không hợp lệ" });
+
+    // Không đổi loại khi danh mục đã được giao dịch hoặc ngân sách sử dụng.
+    if (type !== undefined && type !== doc.data().type) {
+      const [txSnap, budgetSnap] = await Promise.all([
+        userCollection(req.uid, "transactions").get(),
+        userCollection(req.uid, "budgets").get()
+      ]);
+      const txUsed = txSnap.docs.some(d => (d.data().category ?? d.data().categoryId) === id);
+      const budgetUsed = budgetSnap.docs.some(d => (d.data().category ?? d.data().categoryId) === id);
+      if (txUsed || budgetUsed) return res.status(409).json({ error: "Danh mục đang được sử dụng, không thể đổi loại" });
+    }
+    const changes = { updatedAt: FieldValue.serverTimestamp() };
+    if (name !== undefined) changes.name = name.trim();
+    if (type !== undefined) changes.type = type;
+    if (icon !== undefined) changes.icon = icon.trim() || "category";
+    await ref.update(changes);
+    const updated = await ref.get();
+    return res.json({ message: "Cập nhật danh mục thành công", data: { id, ...updated.data() } });
+  } catch (e) { return next(e); }
+});
+
+app.delete("/categories/:id", async (req, res, next) => {
+  try {
+    const id = req.params.id;
+    if (!/^[a-zA-Z0-9_-]+$/.test(id)) return res.status(400).json({ error: "ID danh mục không hợp lệ" });
+    if (DEFAULT_CATEGORIES.some(c => c.id === id)) return res.status(403).json({ error: "Không thể xóa danh mục mặc định" });
+    const ref = userCollection(req.uid, "categories").doc(id);
+    const doc = await ref.get();
+    if (!doc.exists) return res.status(404).json({ error: "Danh mục không tồn tại" });
+    const [txSnap, budgetSnap] = await Promise.all([
+      userCollection(req.uid, "transactions").get(),
+      userCollection(req.uid, "budgets").get()
+    ]);
+    const txUsed = txSnap.docs.some(d => (d.data().category ?? d.data().categoryId) === id);
+    const budgetUsed = budgetSnap.docs.some(d => (d.data().category ?? d.data().categoryId) === id);
+    if (txUsed || budgetUsed) return res.status(409).json({ error: "Danh mục đang có giao dịch hoặc ngân sách, không thể xóa" });
+    await ref.delete();
+    return res.json({ message: "Xóa danh mục thành công", id });
+  } catch (e) { return next(e); }
+});
+
 app.get("/budgets", async (req, res, next) => {
   try {
     const { month } = req.query;
@@ -759,6 +814,82 @@ app.post("/receipts/upload", upload.single("file"), async (req, res, next) => {
     });
   } catch (e) { return next(e); }
 });
+
+
+// ===== Chức năng 7: Xem và tải hóa đơn qua API xác thực =====
+// Không công khai GCS bucket và không lấy tùy ý một gs:// path từ client.
+async function resolveUserReceipt(req, res) {
+  const transactionId = req.params.transactionId;
+  if (!/^[a-zA-Z0-9_-]+$/.test(transactionId)) {
+    res.status(400).json({ error: "ID giao dịch không hợp lệ" });
+    return null;
+  }
+  const tx = await userCollection(req.uid, "transactions").doc(transactionId).get();
+  if (!tx.exists) {
+    res.status(404).json({ error: "Giao dịch không tồn tại" });
+    return null;
+  }
+  const receiptPath = tx.data().receiptPath;
+  if (typeof receiptPath !== "string" || !receiptPath.startsWith("gs://")) {
+    res.status(404).json({ error: "Giao dịch chưa có hóa đơn" });
+    return null;
+  }
+  if (!RECEIPTS_BUCKET) {
+    res.status(503).json({ error: "Chưa cấu hình RECEIPTS_BUCKET" });
+    return null;
+  }
+  const prefix = `gs://${RECEIPTS_BUCKET}/receipts/${req.uid}/`;
+  if (!receiptPath.startsWith(prefix)) {
+    res.status(403).json({ error: "Hóa đơn không thuộc người dùng hiện tại" });
+    return null;
+  }
+  const objectName = receiptPath.slice(`gs://${RECEIPTS_BUCKET}/`.length);
+  if (objectName.includes("..") || !/^receipts\/[A-Za-z0-9_-]+\/[A-Za-z0-9._-]+$/.test(objectName)) {
+    res.status(400).json({ error: "Đường dẫn hóa đơn không hợp lệ" });
+    return null;
+  }
+  return { file: storage.bucket(RECEIPTS_BUCKET).file(objectName), objectName };
+}
+
+app.get("/receipts/:transactionId/links", async (req, res, next) => {
+  try {
+    const receipt = await resolveUserReceipt(req, res);
+    if (!receipt) return;
+    const base = `${req.protocol}://${req.get("host")}`;
+    const id = encodeURIComponent(req.params.transactionId);
+    return res.json({
+      transactionId: req.params.transactionId,
+      viewUrl: `${base}/receipts/${id}/view`,
+      downloadUrl: `${base}/receipts/${id}/download`,
+      authorization: "Bearer Firebase ID token required on both URLs"
+    });
+  } catch (e) { return next(e); }
+});
+
+async function serveReceipt(req, res, next, attachment) {
+  try {
+    const receipt = await resolveUserReceipt(req, res);
+    if (!receipt) return;
+    const [metadata] = await receipt.file.getMetadata();
+    const contentType = metadata.contentType;
+    if (!["image/jpeg", "image/png", "image/webp"].includes(contentType)) {
+      return res.status(415).json({ error: "Định dạng hóa đơn không hỗ trợ" });
+    }
+    res.setHeader("Content-Type", contentType);
+    res.setHeader("Cache-Control", "private, no-store");
+    res.setHeader("X-Content-Type-Options", "nosniff");
+    const name = `receipt-${req.params.transactionId}.${contentType.split("/")[1] === "jpeg" ? "jpg" : contentType.split("/")[1]}`;
+    res.setHeader("Content-Disposition", `${attachment ? "attachment" : "inline"}; filename="${name}"`);
+    receipt.file.createReadStream()
+      .on("error", e => { if (!res.headersSent) next(e); else res.destroy(e); })
+      .pipe(res);
+  } catch (e) { return next(e); }
+}
+
+app.get("/receipts/:transactionId/view", (req, res, next) => serveReceipt(req, res, next, false));
+app.get("/receipts/:transactionId/download", (req, res, next) => serveReceipt(req, res, next, true));
+
+
 
 app.get("/reports/summary", async (req, res, next) => {
   try {
