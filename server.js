@@ -102,11 +102,23 @@ function validateTransaction(body) {
   return null;
 }
 
-async function categoryExists(uid, categoryId) {
-  if (DEFAULT_CATEGORIES.some(c => c.id === categoryId)) return true;
-  const doc = await userCollection(uid, "categories").doc(categoryId).get();
-  return doc.exists;
+
+async function categoryExists(uid, categoryId, type) {
+  const defaultCategory = DEFAULT_CATEGORIES.find(
+    c => c.id === categoryId
+  );
+
+  if (defaultCategory) {
+    return defaultCategory.type === type;
+  }
+
+  const doc = await userCollection(uid, "categories")
+    .doc(categoryId)
+    .get();
+
+  return doc.exists && doc.data().type === type;
 }
+
 
 app.get("/", (req, res) => res.json({ name: "Quản lý chi tiêu API", status: "ok", health: "/health" }));
 app.get("/health", (req, res) =>
@@ -135,12 +147,34 @@ app.get("/transactions", async (req, res, next) => {
   } catch (e) { return next(e); }
 });
 
+app.get("/transactions/:id", async (req, res, next) => {
+  try {
+    const ref = userCollection(req.uid, "transactions")
+      .doc(req.params.id);
+
+    const doc = await ref.get();
+
+    if (!doc.exists) {
+      return res.status(404).json({
+        error: "Không tìm thấy giao dịch"
+      });
+    }
+
+    return res.json({
+      data: toTransaction(doc.id, doc.data())
+    });
+  } catch (error) {
+    return next(error);
+  }
+});
+
+
 app.post("/transactions", async (req, res, next) => {
   try {
     const input = transactionInput(req.body);
     const validationError = validateTransaction(input);
     if (validationError) return res.status(400).json({ error: validationError });
-    if (!(await categoryExists(req.uid, input.categoryId))) return res.status(400).json({ error: "category không tồn tại" });
+    if (!(await categoryExists(req.uid, input.categoryId, input.type))) return res.status(400).json({ error: "category không tồn tại" });
     const uid = req.uid;
     const ref = userCollection(uid, "transactions").doc();
     const data = {
@@ -183,112 +217,342 @@ try {
   } catch (e) { return next(e); }
 });
 
+
+/* =====================================================
+   CHỨC NĂNG 1: QUẢN LÝ GIAO DỊCH
+===================================================== */
+
+// PUT /transactions/:id - Cập nhật giao dịch
 app.put("/transactions/:id", async (req, res, next) => {
   try {
     const input = transactionInput(req.body);
     const validationError = validateTransaction(input);
-    if (validationError) return res.status(400).json({ error: validationError });
-    if (!(await categoryExists(req.uid, input.categoryId))) return res.status(400).json({ error: "category không tồn tại" });
-    const ref = userCollection(req.uid, "transactions").doc(req.params.id);
+
+    if (validationError) {
+      return res.status(400).json({ error: validationError });
+    }
+
+    const ref = userCollection(req.uid, "transactions")
+      .doc(req.params.id);
+
     const current = await ref.get();
-    if (!current.exists) return res.status(404).json({ error: "Không tìm thấy giao dịch" });
+
+    if (!current.exists) {
+      return res.status(404).json({
+        error: "Không tìm thấy giao dịch"
+      });
+    }
+
+    const validCategory = await categoryExists(
+      req.uid,
+      input.categoryId,
+      input.type
+    );
+
+    if (!validCategory) {
+      return res.status(400).json({
+        error: "Danh mục không tồn tại hoặc không đúng loại thu/chi"
+      });
+    }
+
     const updated = {
-      amount: input.amount, type: input.type, category: input.categoryId,
-      date: input.date, month: input.date.slice(0, 7), note: (input.note || "").trim(),
-      receiptPath: input.receiptPath === undefined ? (current.data().receiptPath || null) : input.receiptPath,
+      amount: input.amount,
+      type: input.type,
+      category: input.categoryId,
+      date: input.date,
+      month: input.date.slice(0, 7),
+      note: (input.note || "").trim(),
+      receiptPath: input.receiptPath === undefined
+        ? (current.data().receiptPath || null)
+        : input.receiptPath,
       updatedAt: FieldValue.serverTimestamp()
     };
+
     await ref.update(updated);
+
     const saved = await ref.get();
-    return res.json({ message: "Cập nhật giao dịch thành công", data: toTransaction(ref.id, saved.data()) });
-  } catch (e) { return next(e); }
+
+    return res.json({
+      message: "Cập nhật giao dịch thành công",
+      data: toTransaction(ref.id, saved.data())
+    });
+  } catch (error) {
+    return next(error);
+  }
 });
 
+// DELETE /transactions/:id - Xóa giao dịch
 app.delete("/transactions/:id", async (req, res, next) => {
   try {
-    const ref = userCollection(req.uid, "transactions").doc(req.params.id);
+    const ref = userCollection(req.uid, "transactions")
+      .doc(req.params.id);
+
     const doc = await ref.get();
-    if (!doc.exists) return res.status(404).json({ error: "Không tìm thấy giao dịch" });
+
+    if (!doc.exists) {
+      return res.status(404).json({
+        error: "Không tìm thấy giao dịch"
+      });
+    }
+
     await ref.delete();
-    return res.json({ message: "Xóa giao dịch thành công", id: req.params.id });
-  } catch (e) { return next(e); }
+
+    return res.json({
+      message: "Xóa giao dịch thành công",
+      id: req.params.id
+    });
+  } catch (error) {
+    return next(error);
+  }
 });
 
+/* =====================================================
+   CHỨC NĂNG 2: QUẢN LÝ DANH MỤC THU CHI
+===================================================== */
+
+// GET /categories - Lấy danh sách danh mục
 app.get("/categories", async (req, res, next) => {
   try {
-    const snap = await userCollection(req.uid, "categories").get();
-    const custom = snap.docs.map(d => ({ id: d.id, ...d.data() }));
-    const merged = [...DEFAULT_CATEGORIES, ...custom.filter(c => !DEFAULT_CATEGORIES.some(d => d.id === c.id))];
-    return res.json({ total: merged.length, data: merged });
-  } catch (e) { return next(e); }
+    const snapshot = await userCollection(
+      req.uid,
+      "categories"
+    ).get();
+
+    const customCategories = snapshot.docs.map(doc => ({
+      id: doc.id,
+      ...doc.data()
+    }));
+
+    const categories = [
+      ...DEFAULT_CATEGORIES,
+      ...customCategories.filter(
+        category => !DEFAULT_CATEGORIES.some(
+          item => item.id === category.id
+        )
+      )
+    ];
+
+    return res.json({
+      total: categories.length,
+      data: categories
+    });
+  } catch (error) {
+    return next(error);
+  }
 });
 
+// POST /categories - Thêm danh mục mới
 app.post("/categories", async (req, res, next) => {
   try {
     const { id, name, type, icon } = req.body || {};
-    if (typeof name !== "string" || !name.trim()) return res.status(400).json({ error: "name là bắt buộc" });
-    if (!["expense", "income"].includes(type)) return res.status(400).json({ error: "type chỉ nhận expense hoặc income" });
-    const categoryId = (typeof id === "string" && /^[a-zA-Z0-9_-]+$/.test(id))
-      ? id
-      : name.trim().toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "").replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
-    if (!categoryId) return res.status(400).json({ error: "Không tạo được id danh mục" });
-    if (DEFAULT_CATEGORIES.some(c => c.id === categoryId)) return res.status(409).json({ error: "ID danh mục mặc định đã tồn tại" });
-    const ref = userCollection(req.uid, "categories").doc(categoryId);
-    if ((await ref.get()).exists) return res.status(409).json({ error: "Danh mục đã tồn tại" });
-    const data = { name: name.trim(), type, icon: typeof icon === "string" ? icon : "category", isDefault: false, createdAt: FieldValue.serverTimestamp() };
+
+    if (typeof name !== "string" || !name.trim()) {
+      return res.status(400).json({
+        error: "Tên danh mục là bắt buộc"
+      });
+    }
+
+    if (!["income", "expense"].includes(type)) {
+      return res.status(400).json({
+        error: "Loại danh mục phải là income hoặc expense"
+      });
+    }
+
+    const categoryId =
+      typeof id === "string" && /^[a-zA-Z0-9_-]+$/.test(id)
+        ? id
+        : name.trim()
+            .toLowerCase()
+            .normalize("NFD")
+            .replace(/[\u0300-\u036f]/g, "")
+            .replace(/đ/g, "d")
+            .replace(/[^a-z0-9]+/g, "-")
+            .replace(/^-|-$/g, "");
+
+    if (!categoryId) {
+      return res.status(400).json({
+        error: "Không tạo được mã danh mục"
+      });
+    }
+
+    if (DEFAULT_CATEGORIES.some(c => c.id === categoryId)) {
+      return res.status(409).json({
+        error: "Mã danh mục mặc định đã tồn tại"
+      });
+    }
+
+    const ref = userCollection(req.uid, "categories")
+      .doc(categoryId);
+
+    const existing = await ref.get();
+
+    if (existing.exists) {
+      return res.status(409).json({
+        error: "Danh mục đã tồn tại"
+      });
+    }
+
+    const data = {
+      name: name.trim(),
+      type,
+      icon: typeof icon === "string" && icon.trim()
+        ? icon.trim()
+        : "category",
+      isDefault: false,
+      createdAt: FieldValue.serverTimestamp()
+    };
+
     await ref.set(data);
-    return res.status(201).json({ message: "Tạo danh mục thành công", data: { id: categoryId, ...data } });
-  } catch (e) { return next(e); }
+
+    const saved = await ref.get();
+
+    return res.status(201).json({
+      message: "Tạo danh mục thành công",
+      data: {
+        id: categoryId,
+        ...saved.data()
+      }
+    });
+  } catch (error) {
+    return next(error);
+  }
 });
 
+/* =====================================================
+   CHỨC NĂNG 3: QUẢN LÝ NGÂN SÁCH
+===================================================== */
+
+// GET /budgets - Lấy danh sách ngân sách
 app.get("/budgets", async (req, res, next) => {
   try {
     const { month } = req.query;
-    if (month && !isValidMonth(month)) return res.status(400).json({ error: "month phải có định dạng YYYY-MM" });
+
+    if (month && !isValidMonth(month)) {
+      return res.status(400).json({
+        error: "Tháng phải có định dạng YYYY-MM"
+      });
+    }
+
     let query = userCollection(req.uid, "budgets");
-    if (month) query = query.where("month", "==", month);
-    const snap = await query.get();
-    const data = await Promise.all(snap.docs.map(async doc => {
-      const budget = doc.data();
-      const category = budget.category ?? budget.categoryId;
-      const spent = await getSpent(req.uid, budget.month, category);
-      return toBudget(doc.id, budget, spent);
-    }));
-    return res.json({ total: data.length, data });
-  } catch (e) { return next(e); }
+
+    if (month) {
+      query = query.where("month", "==", month);
+    }
+
+    const snapshot = await query.get();
+
+    const data = await Promise.all(
+      snapshot.docs.map(async doc => {
+        const budget = doc.data();
+
+        const category = budget.category ?? budget.categoryId;
+
+        const spent = await getSpent(
+          req.uid,
+          budget.month,
+          category
+        );
+
+        return toBudget(doc.id, budget, spent);
+      })
+    );
+
+    return res.json({
+      total: data.length,
+      data
+    });
+  } catch (error) {
+    return next(error);
+  }
 });
 
+// POST /budgets - Thêm hoặc cập nhật ngân sách
 app.post("/budgets", async (req, res, next) => {
   try {
-    const { month } = req.body || {};
-    const categoryId = req.body?.category ?? req.body?.categoryId;
-    const limitAmount = req.body?.limit ?? req.body?.limitAmount;
-    if (typeof categoryId !== "string" || !(await categoryExists(req.uid, categoryId))) return res.status(400).json({ error: "category không tồn tại" });
-    if (!isValidMonth(month)) return res.status(400).json({ error: "month phải có định dạng YYYY-MM" });
-    if (!Number.isSafeInteger(limitAmount) || limitAmount <= 0) return res.status(400).json({ error: "limit phải là số nguyên dương tính bằng VND" });
-    const id = `${categoryId}_${month}`;
-    const ref = userCollection(req.uid, "budgets").doc(id);
+    const body = req.body || {};
+
+    const month = body.month;
+    const categoryId = body.category ?? body.categoryId;
+    const limitAmount = body.limit ?? body.limitAmount;
+
+    if (typeof categoryId !== "string" || !categoryId.trim()) {
+      return res.status(400).json({
+        error: "Danh mục ngân sách là bắt buộc"
+      });
+    }
+
+    if (!isValidMonth(month)) {
+      return res.status(400).json({
+        error: "Tháng phải có định dạng YYYY-MM"
+      });
+    }
+
+    if (!Number.isSafeInteger(limitAmount) || limitAmount <= 0) {
+      return res.status(400).json({
+        error: "Hạn mức phải là số nguyên dương tính bằng VND"
+      });
+    }
+
+    // Ngân sách chỉ được gắn với danh mục chi
+    const validCategory = await categoryExists(
+      req.uid,
+      categoryId,
+      "expense"
+    );
+
+    if (!validCategory) {
+      return res.status(400).json({
+        error: "Ngân sách chỉ được tạo cho danh mục chi tiêu hợp lệ"
+      });
+    }
+
+    const budgetId = `${categoryId}_${month}`;
+
+    const ref = userCollection(req.uid, "budgets")
+      .doc(budgetId);
+
     const old = await ref.get();
+
+    const oldData = old.exists ? old.data() : {};
+
     const data = {
-      category: categoryId, month, limit: limitAmount,
-alerted: old.exists ? Boolean(old.data().alerted) : false,
-warningAlerted: old.exists
-  ? Boolean(old.data().warningAlerted)
-  : false,
-exceededAlerted: old.exists
-  ? Boolean(old.data().exceededAlerted)
-  : false,
+      category: categoryId,
+      month,
+      limit: limitAmount,
+
+      // Giữ trạng thái cảnh báo cũ để tránh gửi trùng
+      alerted: Boolean(oldData.alerted),
+      warningAlerted: Boolean(oldData.warningAlerted),
+      exceededAlerted: Boolean(oldData.exceededAlerted),
 
       updatedAt: FieldValue.serverTimestamp()
     };
-    if (!old.exists) data.createdAt = FieldValue.serverTimestamp();
+
+    if (!old.exists) {
+      data.createdAt = FieldValue.serverTimestamp();
+    }
+
     await ref.set(data, { merge: true });
+
+    const saved = await ref.get();
+
+    const spent = await getSpent(
+      req.uid,
+      month,
+      categoryId
+    );
+
     return res.status(old.exists ? 200 : 201).json({
-      message: old.exists ? "Cập nhật ngân sách thành công" : "Tạo ngân sách thành công",
-      data: toBudget(id, data, await getSpent(req.uid, month, categoryId))
+      message: old.exists
+        ? "Cập nhật ngân sách thành công"
+        : "Tạo ngân sách thành công",
+      data: toBudget(budgetId, saved.data(), spent)
     });
-  } catch (e) { return next(e); }
+  } catch (error) {
+    return next(error);
+  }
 });
+
 
 app.delete("/budgets/:id", async (req, res, next) => {
   try {
