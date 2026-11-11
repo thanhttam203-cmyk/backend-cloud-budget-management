@@ -16,7 +16,7 @@ async function createTransactionWithBudgetAlerts({
       return { alerts: [] };
     }
 
-    const budgetId = `${data.categoryId}_${data.month}`;
+    const budgetId = `${(data.category ?? data.categoryId)}_${data.month}`;
 
     const budgetRef = db.collection("users")
       .doc(uid)
@@ -47,7 +47,7 @@ async function createTransactionWithBudgetAlerts({
 
       if (
         item.type === "expense" &&
-        item.categoryId === data.categoryId
+        (item.category ?? item.categoryId) === (data.category ?? data.categoryId)
       ) {
         if (!Number.isSafeInteger(item.amount) || item.amount <= 0) {
           throw new Error("Giao dich co so tien khong hop le");
@@ -69,7 +69,7 @@ async function createTransactionWithBudgetAlerts({
 
     const alerts = getPendingBudgetAlerts({
       currentSpent,
-      limitAmount: budget.limitAmount,
+      limitAmount: (budget.limit ?? budget.limitAmount),
       warningAlerted: Boolean(budget.warningAlerted),
       exceededAlerted: Boolean(budget.exceededAlerted)
     });
@@ -102,11 +102,11 @@ async function createTransactionWithBudgetAlerts({
           uid,
           budgetId,
           transactionId: transactionRef.id,
-          categoryId: data.categoryId,
+          categoryId: (data.category ?? data.categoryId),
           month: data.month,
           previousSpent,
           currentSpent,
-          limitAmount: budget.limitAmount,
+          limitAmount: (budget.limit ?? budget.limitAmount),
           status: "pending",
           createdAt: FieldValue.serverTimestamp()
         });

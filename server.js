@@ -22,9 +22,32 @@ const PORT = Number(process.env.PORT) || 8080;
 const PROJECT_ID = process.env.GOOGLE_CLOUD_PROJECT || process.env.GCLOUD_PROJECT;
 const TOPIC_NAME = process.env.PUBSUB_TOPIC || "transaction-created";
 const RECEIPTS_BUCKET = process.env.RECEIPTS_BUCKET;
-const GROUP_UID = "group4-demo";
+// Firestore documents are scoped to the verified Firebase Authentication UID.
+const { getApps, initializeApp } = require("firebase-admin/app");
+const { getAuth } = require("firebase-admin/auth");
+if (!getApps().length) initializeApp();
 
-app.use(cors());
+async function requireAuth(req, res, next) {
+  // Explicit local-only testing mode; never enabled in Cloud Run production.
+  if (process.env.NODE_ENV !== "production" && process.env.ENABLE_DEV_AUTH === "true") {
+    const uid = process.env.DEV_UID;
+    if (!uid) return res.status(503).json({ error: "Chưa cấu hình DEV_UID" });
+    req.uid = uid;
+    return next();
+  }
+  const match = /^Bearer\s+(.+)$/i.exec(req.headers.authorization || "");
+  if (!match) return res.status(401).json({ error: "Cần Firebase ID token trong Authorization: Bearer ..." });
+  try {
+    const decoded = await getAuth().verifyIdToken(match[1]);
+    req.uid = decoded.uid;
+    return next();
+  } catch (error) {
+    return res.status(401).json({ error: "Firebase ID token không hợp lệ hoặc hết hạn" });
+  }
+}
+
+
+app.use(cors({ origin: process.env.CORS_ORIGIN ? process.env.CORS_ORIGIN.split(",") : true }));
 app.use(express.json({ limit: "1mb" }));
 
 // ADC: local dùng gcloud ADC; Cloud Run dùng service account.
@@ -54,11 +77,25 @@ function isValidDate(value) {
   return !Number.isNaN(d.getTime()) && d.toISOString().slice(0, 10) === value;
 }
 
+const { transactionInput, toTransaction, toBudget } = require("./api-schema");
+async function getSpent(uid, month, category) {
+  const snap = await userCollection(uid, "transactions").where("month", "==", month).get();
+  let spent = 0;
+  for (const doc of snap.docs) {
+    const tx = doc.data();
+    if (tx.type === "expense" && (tx.category ?? tx.categoryId) === category) {
+      if (!Number.isSafeInteger(tx.amount) || tx.amount <= 0 ||
+          !Number.isSafeInteger(spent + tx.amount)) throw new Error("Dữ liệu chi tiêu không hợp lệ");
+      spent += tx.amount;
+    }
+  }
+  return spent;
+}
 function validateTransaction(body) {
   if (!body || typeof body !== "object" || Array.isArray(body)) return "Body phải là JSON object";
   if (!Number.isSafeInteger(body.amount) || body.amount <= 0) return "amount phải là số nguyên dương tính bằng VND";
   if (!["expense", "income"].includes(body.type)) return "type chỉ nhận expense hoặc income";
-  if (typeof body.categoryId !== "string" || !body.categoryId.trim()) return "categoryId là bắt buộc";
+  if (typeof body.categoryId !== "string" || !body.categoryId.trim()) return "category là bắt buộc";
   if (!isValidDate(body.date)) return "date phải là ngày hợp lệ theo định dạng YYYY-MM-DD";
   if (body.note !== undefined && typeof body.note !== "string") return "note phải là chuỗi";
   if (body.receiptPath !== undefined && body.receiptPath !== null && typeof body.receiptPath !== "string") return "receiptPath phải là chuỗi hoặc null";
@@ -80,32 +117,36 @@ app.get("/health", (req, res) =>
   })
 );
 
+app.use(requireAuth);
+
 app.get("/transactions", async (req, res, next) => {
   try {
     const { month, type, categoryId } = req.query;
     if (month && !isValidMonth(month)) return res.status(400).json({ error: "month phải có định dạng YYYY-MM" });
     if (type && !["expense", "income"].includes(type)) return res.status(400).json({ error: "type chỉ nhận expense hoặc income" });
-    let query = userCollection(GROUP_UID, "transactions");
+    let query = userCollection(req.uid, "transactions");
     if (month) query = query.where("month", "==", month);
-    if (type) query = query.where("type", "==", type);
-    if (categoryId) query = query.where("categoryId", "==", categoryId);
     const snap = await query.get();
-    const data = snap.docs.map(d => ({ id: d.id, ...d.data() })).sort((a, b) => String(b.date).localeCompare(String(a.date)));
+    const filterCategory = req.query.category || categoryId;
+    const data = snap.docs.map(d => toTransaction(d.id, d.data()))
+      .filter(t => (!type || t.type === type) && (!filterCategory || t.category === filterCategory))
+      .sort((a, b) => String(b.date).localeCompare(String(a.date)));
     return res.json({ total: data.length, data });
   } catch (e) { return next(e); }
 });
 
 app.post("/transactions", async (req, res, next) => {
   try {
-    const validationError = validateTransaction(req.body);
+    const input = transactionInput(req.body);
+    const validationError = validateTransaction(input);
     if (validationError) return res.status(400).json({ error: validationError });
-    if (!(await categoryExists(GROUP_UID, req.body.categoryId))) return res.status(400).json({ error: "categoryId không tồn tại" });
-    const uid = GROUP_UID;
+    if (!(await categoryExists(req.uid, input.categoryId))) return res.status(400).json({ error: "category không tồn tại" });
+    const uid = req.uid;
     const ref = userCollection(uid, "transactions").doc();
     const data = {
-      amount: req.body.amount, type: req.body.type, categoryId: req.body.categoryId,
-      date: req.body.date, month: req.body.date.slice(0, 7), note: (req.body.note || "").trim(),
-      receiptPath: req.body.receiptPath || null,
+      amount: input.amount, type: input.type, category: input.categoryId,
+      date: input.date, month: input.date.slice(0, 7), note: (input.note || "").trim(),
+      receiptPath: input.receiptPath || null,
       createdAt: FieldValue.serverTimestamp(), updatedAt: FieldValue.serverTimestamp()
     };
    await createTransactionWithBudgetAlerts({
@@ -130,7 +171,7 @@ try {
     try {
       await pubsub.topic(TOPIC_NAME).publishMessage({
         data: Buffer.from(JSON.stringify({
-          event: "transaction.created", transactionId: ref.id, uid, categoryId: data.categoryId,
+          event: "transaction.created", transactionId: ref.id, uid, categoryId: data.category,
           month: data.month, type: data.type, amount: data.amount, createdAt: new Date().toISOString()
         }))
       });
@@ -138,33 +179,34 @@ try {
       console.error("Không gửi được sự kiện Pub/Sub (giao dịch đã lưu):", pubsubError.message);
     }
     const saved = await ref.get();
-    return res.status(201).json({ message: "Thêm giao dịch thành công", data: { id: ref.id, ...saved.data() } });
+    return res.status(201).json({ message: "Thêm giao dịch thành công", data: toTransaction(ref.id, saved.data()) });
   } catch (e) { return next(e); }
 });
 
 app.put("/transactions/:id", async (req, res, next) => {
   try {
-    const validationError = validateTransaction(req.body);
+    const input = transactionInput(req.body);
+    const validationError = validateTransaction(input);
     if (validationError) return res.status(400).json({ error: validationError });
-    if (!(await categoryExists(GROUP_UID, req.body.categoryId))) return res.status(400).json({ error: "categoryId không tồn tại" });
-    const ref = userCollection(GROUP_UID, "transactions").doc(req.params.id);
+    if (!(await categoryExists(req.uid, input.categoryId))) return res.status(400).json({ error: "category không tồn tại" });
+    const ref = userCollection(req.uid, "transactions").doc(req.params.id);
     const current = await ref.get();
     if (!current.exists) return res.status(404).json({ error: "Không tìm thấy giao dịch" });
     const updated = {
-      amount: req.body.amount, type: req.body.type, categoryId: req.body.categoryId,
-      date: req.body.date, month: req.body.date.slice(0, 7), note: (req.body.note || "").trim(),
-      receiptPath: req.body.receiptPath === undefined ? (current.data().receiptPath || null) : req.body.receiptPath,
+      amount: input.amount, type: input.type, category: input.categoryId,
+      date: input.date, month: input.date.slice(0, 7), note: (input.note || "").trim(),
+      receiptPath: input.receiptPath === undefined ? (current.data().receiptPath || null) : input.receiptPath,
       updatedAt: FieldValue.serverTimestamp()
     };
     await ref.update(updated);
     const saved = await ref.get();
-    return res.json({ message: "Cập nhật giao dịch thành công", data: { id: ref.id, ...saved.data() } });
+    return res.json({ message: "Cập nhật giao dịch thành công", data: toTransaction(ref.id, saved.data()) });
   } catch (e) { return next(e); }
 });
 
 app.delete("/transactions/:id", async (req, res, next) => {
   try {
-    const ref = userCollection(GROUP_UID, "transactions").doc(req.params.id);
+    const ref = userCollection(req.uid, "transactions").doc(req.params.id);
     const doc = await ref.get();
     if (!doc.exists) return res.status(404).json({ error: "Không tìm thấy giao dịch" });
     await ref.delete();
@@ -174,7 +216,7 @@ app.delete("/transactions/:id", async (req, res, next) => {
 
 app.get("/categories", async (req, res, next) => {
   try {
-    const snap = await userCollection(GROUP_UID, "categories").get();
+    const snap = await userCollection(req.uid, "categories").get();
     const custom = snap.docs.map(d => ({ id: d.id, ...d.data() }));
     const merged = [...DEFAULT_CATEGORIES, ...custom.filter(c => !DEFAULT_CATEGORIES.some(d => d.id === c.id))];
     return res.json({ total: merged.length, data: merged });
@@ -191,7 +233,7 @@ app.post("/categories", async (req, res, next) => {
       : name.trim().toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "").replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
     if (!categoryId) return res.status(400).json({ error: "Không tạo được id danh mục" });
     if (DEFAULT_CATEGORIES.some(c => c.id === categoryId)) return res.status(409).json({ error: "ID danh mục mặc định đã tồn tại" });
-    const ref = userCollection(GROUP_UID, "categories").doc(categoryId);
+    const ref = userCollection(req.uid, "categories").doc(categoryId);
     if ((await ref.get()).exists) return res.status(409).json({ error: "Danh mục đã tồn tại" });
     const data = { name: name.trim(), type, icon: typeof icon === "string" ? icon : "category", isDefault: false, createdAt: FieldValue.serverTimestamp() };
     await ref.set(data);
@@ -203,25 +245,32 @@ app.get("/budgets", async (req, res, next) => {
   try {
     const { month } = req.query;
     if (month && !isValidMonth(month)) return res.status(400).json({ error: "month phải có định dạng YYYY-MM" });
-    let query = userCollection(GROUP_UID, "budgets");
+    let query = userCollection(req.uid, "budgets");
     if (month) query = query.where("month", "==", month);
     const snap = await query.get();
-    const data = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+    const data = await Promise.all(snap.docs.map(async doc => {
+      const budget = doc.data();
+      const category = budget.category ?? budget.categoryId;
+      const spent = await getSpent(req.uid, budget.month, category);
+      return toBudget(doc.id, budget, spent);
+    }));
     return res.json({ total: data.length, data });
   } catch (e) { return next(e); }
 });
 
 app.post("/budgets", async (req, res, next) => {
   try {
-    const { categoryId, month, limitAmount } = req.body || {};
-    if (typeof categoryId !== "string" || !(await categoryExists(GROUP_UID, categoryId))) return res.status(400).json({ error: "categoryId không tồn tại" });
+    const { month } = req.body || {};
+    const categoryId = req.body?.category ?? req.body?.categoryId;
+    const limitAmount = req.body?.limit ?? req.body?.limitAmount;
+    if (typeof categoryId !== "string" || !(await categoryExists(req.uid, categoryId))) return res.status(400).json({ error: "category không tồn tại" });
     if (!isValidMonth(month)) return res.status(400).json({ error: "month phải có định dạng YYYY-MM" });
-    if (!Number.isSafeInteger(limitAmount) || limitAmount <= 0) return res.status(400).json({ error: "limitAmount phải là số nguyên dương tính bằng VND" });
+    if (!Number.isSafeInteger(limitAmount) || limitAmount <= 0) return res.status(400).json({ error: "limit phải là số nguyên dương tính bằng VND" });
     const id = `${categoryId}_${month}`;
-    const ref = userCollection(GROUP_UID, "budgets").doc(id);
+    const ref = userCollection(req.uid, "budgets").doc(id);
     const old = await ref.get();
     const data = {
-      categoryId, month, limitAmount,
+      category: categoryId, month, limit: limitAmount,
 alerted: old.exists ? Boolean(old.data().alerted) : false,
 warningAlerted: old.exists
   ? Boolean(old.data().warningAlerted)
@@ -236,14 +285,14 @@ exceededAlerted: old.exists
     await ref.set(data, { merge: true });
     return res.status(old.exists ? 200 : 201).json({
       message: old.exists ? "Cập nhật ngân sách thành công" : "Tạo ngân sách thành công",
-      data: { id, ...data }
+      data: toBudget(id, data, await getSpent(req.uid, month, categoryId))
     });
   } catch (e) { return next(e); }
 });
 
 app.delete("/budgets/:id", async (req, res, next) => {
   try {
-    const ref = userCollection(GROUP_UID, "budgets").doc(req.params.id);
+    const ref = userCollection(req.uid, "budgets").doc(req.params.id);
     const doc = await ref.get();
     if (!doc.exists) return res.status(404).json({ error: "Không tìm thấy ngân sách" });
     await ref.delete();
@@ -261,7 +310,7 @@ app.get("/budgets/:id/progress", async (req, res, next) => {
 
     // Đọc ngân sách
     const budgetRef = userCollection(
-      GROUP_UID,
+      req.uid,
       "budgets"
     ).doc(budgetId);
 
@@ -283,7 +332,7 @@ app.get("/budgets/:id/progress", async (req, res, next) => {
 
     // Đọc giao dịch đúng tháng
     const snapshot = await userCollection(
-      GROUP_UID,
+      req.uid,
       "transactions"
     )
       .where("month", "==", budget.month)
@@ -297,7 +346,7 @@ app.get("/budgets/:id/progress", async (req, res, next) => {
 
       if (
         item.type === "expense" &&
-        item.categoryId === budget.categoryId
+        (item.category ?? item.categoryId) === (budget.category ?? budget.categoryId)
       ) {
         if (
           !Number.isSafeInteger(item.amount) ||
@@ -320,14 +369,18 @@ app.get("/budgets/:id/progress", async (req, res, next) => {
 
     const progress = calculateBudgetProgress(
       currentSpent,
-      budget.limitAmount
+      (budget.limit ?? budget.limitAmount)
     );
 
     return res.status(200).json({
       budgetId: budgetDoc.id,
-      categoryId: budget.categoryId,
+      category: (budget.category ?? budget.categoryId),
       month: budget.month,
-      ...progress
+      limit: progress.limitAmount,
+      spent: progress.currentSpent,
+      percentage: progress.percentage,
+      remainingAmount: progress.remainingAmount,
+      status: progress.status
     });
 
   } catch (error) {
@@ -346,7 +399,7 @@ app.post("/budgets/:id/check-alert", async (req, res, next) => {
     }
 
     const budgetDoc = await userCollection(
-      GROUP_UID,
+      req.uid,
       "budgets"
     ).doc(req.params.id).get();
 
@@ -365,7 +418,7 @@ app.post("/budgets/:id/check-alert", async (req, res, next) => {
     }
 
     const snapshot = await userCollection(
-      GROUP_UID,
+      req.uid,
       "transactions"
     )
       .where("month", "==", budget.month)
@@ -378,7 +431,7 @@ app.post("/budgets/:id/check-alert", async (req, res, next) => {
 
       if (
         tx.type === "expense" &&
-        tx.categoryId === budget.categoryId
+        (tx.category ?? tx.categoryId) === (budget.category ?? budget.categoryId)
       ) {
         if (!Number.isSafeInteger(tx.amount) || tx.amount <= 0) {
           return res.status(422).json({
@@ -399,13 +452,13 @@ app.post("/budgets/:id/check-alert", async (req, res, next) => {
     const result = evaluateBudgetAlert(
       previousSpent,
       currentSpent,
-      budget.limitAmount
+      (budget.limit ?? budget.limitAmount)
     );
 
     return res.json({
       budgetId: budgetDoc.id,
       month: budget.month,
-      categoryId: budget.categoryId,
+      category: (budget.category ?? budget.categoryId),
       ...result
     });
 
@@ -429,7 +482,7 @@ app.post("/receipts/upload", upload.single("file"), async (req, res, next) => {
     if (!req.file) return res.status(400).json({ error: "Thiếu file ảnh ở field 'file'" });
     if (!RECEIPTS_BUCKET) return res.status(503).json({ error: "Chưa cấu hình biến môi trường RECEIPTS_BUCKET" });
     const ext = ({ "image/jpeg": ".jpg", "image/png": ".png", "image/webp": ".webp" })[req.file.mimetype];
-    const objectName = `receipts/${GROUP_UID}/${Date.now()}-${crypto.randomUUID()}${ext}`;
+    const objectName = `receipts/${req.uid}/${Date.now()}-${crypto.randomUUID()}${ext}`;
     const bucket = storage.bucket(RECEIPTS_BUCKET);
     const file = bucket.file(objectName);
     await file.save(req.file.buffer, {
@@ -447,13 +500,13 @@ app.get("/reports/summary", async (req, res, next) => {
   try {
     const month = req.query.month;
     if (!isValidMonth(month)) return res.status(400).json({ error: "month phải có định dạng YYYY-MM" });
-    const snap = await userCollection(GROUP_UID, "transactions").where("month", "==", month).get();
+    const snap = await userCollection(req.uid, "transactions").where("month", "==", month).get();
     const txs = snap.docs.map(d => d.data());
     const totalIncome = txs.filter(t => t.type === "income").reduce((sum, t) => sum + Number(t.amount || 0), 0);
     const totalExpense = txs.filter(t => t.type === "expense").reduce((sum, t) => sum + Number(t.amount || 0), 0);
     const expensesByCategory = {};
     for (const t of txs) {
-      if (t.type === "expense") expensesByCategory[t.categoryId] = (expensesByCategory[t.categoryId] || 0) + Number(t.amount || 0);
+      if (t.type === "expense") expensesByCategory[t.category ?? t.categoryId] = (expensesByCategory[t.category ?? t.categoryId] || 0) + Number(t.amount || 0);
     }
     return res.json({ month, totalIncome, totalExpense, balance: totalIncome - totalExpense, expensesByCategory });
   } catch (e) { return next(e); }

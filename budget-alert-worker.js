@@ -17,7 +17,7 @@ const PROJECT_ID =
 const TOPIC_NAME =
   process.env.BUDGET_ALERT_TOPIC || "budget-alerts";
 
-const UID = "group4-demo";
+// Process the users present in Firestore, including missing parent docs with subcollections.
 
 const db = new Firestore({ projectId: PROJECT_ID });
 const pubsub = new PubSub({ projectId: PROJECT_ID });
@@ -30,26 +30,22 @@ async function retryPendingAlerts() {
   isProcessing = true;
 
   try {
-    const result = await processBudgetAlertOutbox({
-      db,
-      pubsub,
-      uid: UID,
-      topicName: TOPIC_NAME,
-      limit: 10
-    });
-
-    console.log(
-      `[Outbox] Đã kiểm tra: ${result.processed}, ` +
-      `gửi thành công: ${result.sent}`
-    );
-
-    for (const item of result.results) {
-      if (item.status === "pending") {
-        console.error(
-          `[Outbox] Gửi thất bại ${item.id}: ${item.error}`
-        );
+    const users = await db.collection("users").listDocuments();
+    let processed = 0;
+    let sent = 0;
+    for (const userRef of users) {
+      const result = await processBudgetAlertOutbox({
+        db, pubsub, uid: userRef.id, topicName: TOPIC_NAME, limit: 10
+      });
+      processed += result.processed;
+      sent += result.sent;
+      for (const item of result.results) {
+        if (item.status === "pending") {
+          console.error(`[Outbox] ${userRef.id}/${item.id}: ${item.error}`);
+        }
       }
     }
+    console.log(`[Outbox] Đã kiểm tra: ${processed}, gửi thành công: ${sent}`);
   } catch (error) {
     console.error("[Outbox] Lỗi:", error.message);
   } finally {

@@ -10,3 +10,8 @@ server.js.before-budget.bak
 
 # Temporary Windows files
 New Text Document.txt
+# Live test receipts and temporary scripts
+test-receipts/
+test-budget-worker-live.js
+*service-account*.json
+*credentials*.json
