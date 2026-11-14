@@ -108,6 +108,9 @@ async function createTransactionWithBudgetAlerts({
           currentSpent,
           limitAmount: (budget.limit ?? budget.limitAmount),
           status: "pending",
+          emailStatus: "pending",
+          emailSentAt: null,
+          emailMessageId: null,
           createdAt: FieldValue.serverTimestamp()
         });
       }

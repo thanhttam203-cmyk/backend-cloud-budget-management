@@ -8,6 +8,9 @@ const { PubSub } = require("@google-cloud/pubsub");
 const {
   processBudgetAlertOutbox
 } = require("./budget-alert-outbox");
+const {
+  processBudgetEmailOutbox
+} = require("./budget-alert-email-outbox");
 
 const PROJECT_ID =
   process.env.GOOGLE_CLOUD_PROJECT ||
@@ -31,14 +34,31 @@ async function retryPendingAlerts() {
 
   try {
     const users = await db.collection("users").listDocuments();
-    let processed = 0;
-    let sent = 0;
+   let processed = 0;
+let sent = 0;
+let emailsSent = 0;
     for (const userRef of users) {
       const result = await processBudgetAlertOutbox({
         db, pubsub, uid: userRef.id, topicName: TOPIC_NAME, limit: 10
       });
       processed += result.processed;
       sent += result.sent;
+      try {
+  const emailResult = await processBudgetEmailOutbox({
+    db,
+    uid: userRef.id,
+    limit: 10
+  });
+
+  emailsSent += emailResult.sent;
+
+  console.log(
+    `[Email] Da gui: ${emailResult.sent}`
+  );
+} catch (error) {
+  console.error("[Email] Loi:", error.message);
+}
+      emailsSent += result.emailsSent;
       for (const item of result.results) {
         if (item.status === "pending") {
           console.error(`[Outbox] ${userRef.id}/${item.id}: ${item.error}`);
